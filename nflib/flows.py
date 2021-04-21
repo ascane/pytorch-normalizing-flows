@@ -137,7 +137,7 @@ class SlowMAF(nn.Module):
     """ 
     Masked Autoregressive Flow, slow version with explicit networks per dim
     """
-    def __init__(self, dim, parity, net_class=MLP, nh=24):
+    def __init__(self, dim, parity, net_class=MLP, nh=24, device='cpu'):
         super().__init__()
         self.dim = dim
         self.layers = nn.ModuleDict()
@@ -145,10 +145,11 @@ class SlowMAF(nn.Module):
         for i in range(1, dim):
             self.layers[str(i)] = net_class(i, 2, nh)
         self.order = list(range(dim)) if parity else list(range(dim))[::-1]
+        self.device = device
         
     def forward(self, x):
         z = torch.zeros_like(x)
-        log_det = torch.zeros(x.size(0))
+        log_det = torch.zeros(x.size(0)).to(self.device)
         for i in range(self.dim):
             st = self.layers[str(i)](x[:, :i])
             s, t = st[:, 0], st[:, 1]
@@ -158,7 +159,7 @@ class SlowMAF(nn.Module):
 
     def backward(self, z):
         x = torch.zeros_like(z)
-        log_det = torch.zeros(z.size(0))
+        log_det = torch.zeros(z.size(0)).to(self.device)
         for i in range(self.dim):
             st = self.layers[str(i)](x[:, :i])
             s, t = st[:, 0], st[:, 1]
@@ -169,11 +170,12 @@ class SlowMAF(nn.Module):
 class MAF(nn.Module):
     """ Masked Autoregressive Flow that uses a MADE-style network for fast forward """
     
-    def __init__(self, dim, parity, net_class=ARMLP, nh=24):
+    def __init__(self, dim, parity, net_class=ARMLP, nh=24, device='cpu'):
         super().__init__()
         self.dim = dim
         self.net = net_class(dim, dim*2, nh)
         self.parity = parity
+        self.device = device
 
     def forward(self, x):
         # here we see that we are evaluating all of z in parallel, so density estimation will be fast
@@ -188,13 +190,14 @@ class MAF(nn.Module):
     def backward(self, z):
         # we have to decode the x one at a time, sequentially
         x = torch.zeros_like(z)
-        log_det = torch.zeros(z.size(0))
+        log_det = torch.zeros(z.size(0)).to(self.device)
         z = z.flip(dims=(1,)) if self.parity else z
         for i in range(self.dim):
             st = self.net(x.clone()) # clone to avoid in-place op errors if using IAF
             s, t = st.split(self.dim, dim=1)
             x[:, i] = (z[:, i] - t[:, i]) * torch.exp(-s[:, i])
             log_det += -s[:, i]
+            
         return x, log_det
 
 class IAF(MAF):
@@ -212,10 +215,11 @@ class Invertible1x1Conv(nn.Module):
     As introduced in Glow paper.
     """
     
-    def __init__(self, dim):
+    def __init__(self, dim, device='cpu'):
         super().__init__()
         self.dim = dim
-        Q = torch.nn.init.orthogonal_(torch.randn(dim, dim))
+        self.device = device
+        Q = torch.nn.init.orthogonal_(torch.randn(dim, dim)).to(device)
         P, L, U = torch.lu_unpack(*Q.lu())
         self.P = P # remains fixed during optimization
         self.L = nn.Parameter(L) # lower triangular portion
@@ -224,7 +228,7 @@ class Invertible1x1Conv(nn.Module):
 
     def _assemble_W(self):
         """ assemble W from its pieces (P, L, U, S) """
-        L = torch.tril(self.L, diagonal=-1) + torch.diag(torch.ones(self.dim))
+        L = torch.tril(self.L, diagonal=-1) + torch.diag(torch.ones(self.dim).to(self.device))
         U = torch.triu(self.U, diagonal=1)
         W = self.P @ L @ (U + torch.diag(self.S))
         return W
@@ -247,13 +251,14 @@ class Invertible1x1Conv(nn.Module):
 class NormalizingFlow(nn.Module):
     """ A sequence of Normalizing Flows is a Normalizing Flow """
 
-    def __init__(self, flows):
+    def __init__(self, flows, device='cpu'):
         super().__init__()
         self.flows = nn.ModuleList(flows)
+        self.device = device
 
     def forward(self, x):
         m, _ = x.shape
-        log_det = torch.zeros(m)
+        log_det = torch.zeros(m).to(self.device)
         zs = [x]
         for flow in self.flows:
             x, ld = flow.forward(x)
@@ -263,7 +268,7 @@ class NormalizingFlow(nn.Module):
 
     def backward(self, z):
         m, _ = z.shape
-        log_det = torch.zeros(m)
+        log_det = torch.zeros(m).to(self.device)
         xs = [z]
         for flow in self.flows[::-1]:
             z, ld = flow.backward(z)
@@ -274,18 +279,20 @@ class NormalizingFlow(nn.Module):
 class NormalizingFlowModel(nn.Module):
     """ A Normalizing Flow Model is a (prior, flow) pair """
     
-    def __init__(self, prior, flows):
+    def __init__(self, prior, flows, device='cpu'):
         super().__init__()
         self.prior = prior
-        self.flow = NormalizingFlow(flows)
+        self.flow = NormalizingFlow(flows, device=device)
     
     def forward(self, x):
         zs, log_det = self.flow.forward(x)
+        log_det = log_det
         prior_logprob = self.prior.log_prob(zs[-1]).view(x.size(0), -1).sum(1)
         return zs, prior_logprob, log_det
 
     def backward(self, z):
         xs, log_det = self.flow.backward(z)
+        log_det = log_det
         return xs, log_det
     
     def sample(self, num_samples):
